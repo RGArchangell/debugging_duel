@@ -5,6 +5,7 @@ import random
 import json
 import os
 from filelock import FileLock
+from streamlit_server_state import server_state, server_state_lock
 
 DATA_FILE = "game_state.json"
 LOCK_FILE = "game_state.lock"
@@ -107,18 +108,47 @@ def update_ratings(winner_id, loser_id):
     state["users"][loser_id] = loser
     save_state(state)
 
+    return winner["rating"], loser["rating"]
+
 
 def end_duel(duel_id, winner_id):
     state = load_state()
     duel = state["duels"][duel_id]
     loser_id = duel["user1_id"] if winner_id == duel["user2_id"] else duel["user2_id"]
 
-    update_ratings(winner_id, loser_id)
+    winner_rating, loser_rating = update_ratings(winner_id, loser_id)
     duel["winner_id"] = winner_id
     save_state(state)
 
+    # Notify both users about the duel result and updated ratings
+    with server_state_lock["sse_events"]:
+        server_state.sse_events[winner_id] = json.dumps({
+            "type": "duel_result",
+            "result": "win",
+            "new_rating": winner_rating
+        })
+        server_state.sse_events[loser_id] = json.dumps({
+            "type": "duel_result",
+            "result": "lose",
+            "new_rating": loser_rating
+        })
+
+
+def get_leaderboard():
+    state = load_state()
+    sorted_users = sorted(state["users"].values(), key=lambda x: x["rating"], reverse=True)
+    return [{"username": user["username"], "rating": user["rating"]} for user in sorted_users[:5]]
+
+
+def initialize_sse_events():
+    with server_state_lock["sse_events"]:
+        if "sse_events" not in server_state:
+            server_state.sse_events = {}
+
 
 def main():
+    initialize_sse_events()
+
     st.set_page_config(page_title="Debug Duel", page_icon="🐞", layout="wide")
     st.title("🐞 Debug Duel")
 
@@ -130,6 +160,8 @@ def main():
         st.session_state.duel_id = None
     if "selected_lines" not in st.session_state:
         st.session_state.selected_lines = []
+    if "last_update" not in st.session_state:
+        st.session_state.last_update = time.time()
 
     state = load_state()
 
@@ -167,6 +199,16 @@ def main():
                 if duel_id:
                     st.session_state.duel_id = duel_id
                     st.session_state.in_queue = False
+                    # Notify both users about the new duel
+                    with server_state_lock["sse_events"]:
+                        duel = state["duels"].get(duel_id)
+                        if duel:
+                            for participant_id in [duel.get("user1_id"), duel.get("user2_id")]:
+                                if participant_id:
+                                    server_state.sse_events[participant_id] = json.dumps(
+                                        {"type": "new_duel", "duel_id": duel_id})
+                        else:
+                            st.error(f"Duel with id {duel_id} not found in state.")
                     st.rerun()
                 elif st.button("Leave Queue", key="leave_queue"):
                     state["queue"] = [uid for uid in state["queue"] if uid != user_id]
@@ -182,25 +224,46 @@ def main():
     # Display leaderboard
     st.sidebar.write("---")
     st.sidebar.write("Leaderboard:")
-    sorted_users = sorted(state["users"].values(), key=lambda x: x["rating"], reverse=True)
-    for i, user in enumerate(sorted_users[:5], 1):
-        st.sidebar.write(f"{i}. {user['username']}: {user['rating']:.0f}")
+    leaderboard_placeholder = st.sidebar.empty()
+    update_leaderboard(leaderboard_placeholder)
 
-    # Add JavaScript for automatic updates
+    # Add JavaScript for SSE and real-time updates
     st.markdown("""
     <script>
-    function updateApp() {
-        const elements = window.parent.document.getElementsByTagName("iframe");
-        for (const element of elements) {
-            if (element.height === "0") {
-                element.removeAttribute("srcdoc");
-                element.src = element.src;
+    const evtSource = new EventSource("/stream");
+    evtSource.onmessage = function(event) {
+        const data = JSON.parse(event.data);
+        if (data.type === "duel_result") {
+            if (data.result === "win") {
+                alert("Congratulations! You won the duel!");
+            } else {
+                alert("You lost the duel. Better luck next time!");
             }
+            // Update personal rating
+            const ratingElement = document.querySelector('p:contains("Rating:")');
+            if (ratingElement) {
+                ratingElement.textContent = `Rating: ${data.new_rating.toFixed(0)}`;
+            }
+            // Trigger page reload to update leaderboard
+            location.reload();
+        } else if (data.type === "new_duel") {
+            alert("Opponent found! The duel is starting.");
+            location.reload();
         }
     }
-    setInterval(updateApp, 3000);
     </script>
     """, unsafe_allow_html=True)
+
+    # Periodically check for updates
+    if time.time() - st.session_state.last_update > 5:  # Check every 5 seconds
+        st.session_state.last_update = time.time()
+        st.rerun()
+
+
+def update_leaderboard(placeholder):
+    leaderboard = get_leaderboard()
+    placeholder.write(
+        "\n".join([f"{i + 1}. {user['username']}: {user['rating']:.0f}" for i, user in enumerate(leaderboard)]))
 
 
 def show_duel_interface(duel_id, user_id):
@@ -261,4 +324,5 @@ def show_duel_interface(duel_id, user_id):
 
 
 if __name__ == "__main__":
+    initialize_sse_events()
     main()
