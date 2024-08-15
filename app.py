@@ -112,7 +112,7 @@ def main():
                 st.session_state.global_users[new_user.id] = new_user
                 st.session_state.user_id = new_user.id
                 st.success(f"Welcome, {username}!")
-                st.experimental_rerun()
+                st.rerun()
 
     else:
         user_id = st.session_state.user_id
@@ -127,7 +127,7 @@ def main():
                         st.session_state.global_queue.append(user.id)
                         st.session_state.in_queue = True
                         st.info("Searching for an opponent...")
-                        st.experimental_rerun()
+                        st.rerun()
                 else:
                     st.info("Searching for an opponent...")
                     duel_id = find_opponent()
@@ -135,12 +135,12 @@ def main():
                         st.session_state.duel_id = duel_id
                         st.session_state.in_queue = False
                         st.success("Opponent found! Starting duel...")
-                        st.experimental_rerun()
+                        st.rerun()
                     else:
                         if st.button("Leave Queue"):
                             st.session_state.global_queue.remove(user.id)
                             st.session_state.in_queue = False
-                            st.experimental_rerun()
+                            st.rerun()
 
             else:
                 duel = st.session_state.global_duels[st.session_state.duel_id]
@@ -180,7 +180,7 @@ def main():
                         st.session_state.duel_id = None
                         winner = st.session_state.global_users[winner_id]
                         st.success(f"Duel ended! Winner: {winner.username}")
-                        st.experimental_rerun()
+                        st.rerun()
 
             # Display leaderboard
             st.sidebar.write("---")
@@ -191,7 +191,7 @@ def main():
         else:
             st.error("User data not found. Please log in again.")
             st.session_state.user_id = None
-            st.experimental_rerun()
+            st.rerun()
 
 
 if __name__ == "__main__":
