@@ -11,6 +11,7 @@ from topics import TOPICS_LIST
 import bcrypt
 import secrets
 import logging
+from enum import Enum
 
 logging.basicConfig(level=logging.INFO)
 
@@ -34,6 +35,31 @@ if 'secret_key' not in st.session_state:
     st.session_state['secret_key'] = secrets.token_hex(16)
 if 'current_topic' not in st.session_state:
     st.session_state.current_topic = random.choice(TOPICS_LIST)
+
+class BotDifficulty(Enum):
+    EASY = "easy"
+    HARD = "hard"
+
+
+def generate_bot_response(duel):
+    system_prompt = f"""
+    You are an AI assistant tasked with explaining the bugs in a code snippet. The code snippet contains exactly three bugs related to the topic of {duel['topic']}. Your task is to explain these bugs concisely and accurately.
+    """
+    user_prompt = f"""
+    Here is the code snippet with three bugs:
+
+    {duel['code_snippet']}
+
+    Please explain the three bugs in this code snippet. Be concise and accurate in your explanations. Format your response as a list with three items, each explaining one bug.
+    """
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+
+    result = ai_api.get_chat_completion(messages)
+    return result
 
 
 def load_state():
@@ -156,6 +182,36 @@ class Duel:
         self.errors_found = {user1_id: [], user2_id: []}
         self.submission_time = {user1_id: None, user2_id: None}
         self.accepted_by = []
+        self.is_bot_duel = False
+        self.bot_difficulty = None  # This will be a string now
+        self.topic = random.choice(TOPICS_LIST)
+
+
+def create_bot_duel(user_id, difficulty):
+    bot_id = f"bot_{difficulty.value}"
+    new_duel = Duel(user_id, bot_id)
+    new_duel.is_bot_duel = True
+    new_duel.bot_difficulty = difficulty.value  # Store as a string
+    state = load_state()
+    state["duels"][new_duel.id] = new_duel.__dict__
+    save_state(state)
+    return str(new_duel.id)
+
+
+def bot_find_errors(duel):
+    difficulty = BotDifficulty(duel["bot_difficulty"])  # Convert string back to enum
+    if difficulty == BotDifficulty.HARD:
+        return duel["error_lines"]
+    elif difficulty == BotDifficulty.EASY:
+        correct_lines = duel["error_lines"]
+        all_lines = range(1, len(duel["code_snippet"].split('\n')) + 1)
+        wrong_lines = [line for line in all_lines if line not in correct_lines]
+
+        num_correct = random.randint(1, len(correct_lines))
+        num_wrong = random.randint(0, 2)
+
+        bot_guess = random.sample(correct_lines, num_correct) + random.sample(wrong_lines, num_wrong)
+        return sorted(bot_guess)
 
 
 def find_opponent():
@@ -189,41 +245,65 @@ def send_sse_event(user_id, event_type, data):
 def end_duel(duel_id, winner_id):
     state = load_state()
     duel = state["duels"][duel_id]
-    loser_id = duel["user2_id"] if winner_id == duel["user1_id"] else duel["user1_id"]
 
-    logging.info(f"Ending duel {duel_id}. Winner: {winner_id}, Loser: {loser_id}")
+    if duel["is_bot_duel"]:
+        user_id = duel["user1_id"]
+        bot_id = duel["user2_id"]
+        user = state["users"][user_id]
 
-    winner_rating_before = state["users"][winner_id]["rating"]
-    loser_rating_before = state["users"][loser_id]["rating"]
+        if winner_id == user_id:
+            # User wins against bot
+            rating_change = 10 if duel["bot_difficulty"] == BotDifficulty.EASY.value else 20
+            user["rating"] += rating_change
+        else:
+            # User loses against bot
+            rating_change = -5 if duel["bot_difficulty"] == BotDifficulty.EASY.value else -10
+            user["rating"] += rating_change
 
-    winner_rating, loser_rating = update_ratings(winner_id, loser_id)
+        duel["winner_id"] = winner_id
+        save_state(state)
 
-    logging.info(f"Winner rating: {winner_rating_before} -> {winner_rating}")
-    logging.info(f"Loser rating: {loser_rating_before} -> {loser_rating}")
+        send_sse_event(user_id, "duel_result", {
+            "result": "win" if winner_id == user_id else "lose",
+            "new_rating": user["rating"],
+            "rating_change": rating_change
+        })
+    else:
+        loser_id = duel["user2_id"] if winner_id == duel["user1_id"] else duel["user1_id"]
 
-    # Update the state with new ratings
-    state["users"][winner_id]["rating"] = winner_rating
-    state["users"][loser_id]["rating"] = loser_rating
-    duel["winner_id"] = winner_id
+        logging.info(f"Ending duel {duel_id}. Winner: {winner_id}, Loser: {loser_id}")
 
-    save_state(state)
+        winner_rating_before = state["users"][winner_id]["rating"]
+        loser_rating_before = state["users"][loser_id]["rating"]
 
-    # Verify the state was saved correctly
-    verification_state = load_state()
-    logging.info(f"Verified winner rating: {verification_state['users'][winner_id]['rating']}")
-    logging.info(f"Verified loser rating: {verification_state['users'][loser_id]['rating']}")
+        winner_rating, loser_rating = update_ratings(winner_id, loser_id)
 
-    # Notify both users about the duel result and updated ratings
-    send_sse_event(winner_id, "duel_result", {
-        "result": "win",
-        "new_rating": winner_rating
-    })
-    send_sse_event(loser_id, "duel_result", {
-        "result": "lose",
-        "new_rating": loser_rating
-    })
+        logging.info(f"Winner rating: {winner_rating_before} -> {winner_rating}")
+        logging.info(f"Loser rating: {loser_rating_before} -> {loser_rating}")
 
-    # Update leaderboard for all users
+        # Update the state with new ratings
+        state["users"][winner_id]["rating"] = winner_rating
+        state["users"][loser_id]["rating"] = loser_rating
+        duel["winner_id"] = winner_id
+
+        save_state(state)
+
+        # Verify the state was saved correctly
+        verification_state = load_state()
+        logging.info(f"Verified winner rating: {verification_state['users'][winner_id]['rating']}")
+        logging.info(f"Verified loser rating: {verification_state['users'][loser_id]['rating']}")
+
+        # Notify both users about the duel result and updated ratings
+        send_sse_event(winner_id, "duel_result", {
+            "result": "win",
+            "new_rating": winner_rating
+        })
+        send_sse_event(loser_id, "duel_result", {
+            "result": "lose",
+            "new_rating": loser_rating
+        })
+
+        # Update leaderboard for all users
     update_leaderboard_for_all_users()
 
 
@@ -267,8 +347,13 @@ def get_leaderboard():
 def show_duel_interface(duel_id, user_id):
     state = load_state()
     duel = state["duels"][duel_id]
-    opponent_id = duel["user2_id"] if user_id == duel["user1_id"] else duel["user1_id"]
-    opponent = state["users"][opponent_id]
+
+    if duel["is_bot_duel"]:
+        opponent_id = duel["user2_id"]  # This should be the bot's ID (e.g., "bot_easy" or "bot_hard")
+        opponent = {"username": f"{duel['bot_difficulty'].capitalize()} Bot"}
+    else:
+        opponent_id = duel["user2_id"] if user_id == duel["user1_id"] else duel["user1_id"]
+        opponent = state["users"][opponent_id]
 
     # Check if the duel has already ended
     if duel["winner_id"]:
@@ -283,10 +368,17 @@ def show_duel_interface(duel_id, user_id):
         st.write(f"Your correct errors: {len([e for e in duel['errors_found'][user_id] if e in duel['error_lines']])}")
         st.write(
             f"Your incorrect errors: {len([e for e in duel['errors_found'][user_id] if e not in duel['error_lines']])}")
-        st.write(
-            f"Opponent correct errors: {len([e for e in duel['errors_found'][opponent_id] if e in duel['error_lines']])}")
-        st.write(
-            f"Opponent incorrect errors: {len([e for e in duel['errors_found'][opponent_id] if e not in duel['error_lines']])}")
+
+        if duel["is_bot_duel"]:
+            st.write(
+                f"Bot correct errors: {len([e for e in duel['errors_found'][opponent_id] if e in duel['error_lines']])}")
+            st.write(
+                f"Bot incorrect errors: {len([e for e in duel['errors_found'][opponent_id] if e not in duel['error_lines']])}")
+        else:
+            st.write(
+                f"Opponent correct errors: {len([e for e in duel['errors_found'][opponent_id] if e in duel['error_lines']])}")
+            st.write(
+                f"Opponent incorrect errors: {len([e for e in duel['errors_found'][opponent_id] if e not in duel['error_lines']])}")
 
         if st.button("Start New Duel"):
             st.session_state.duel_id = None
@@ -330,18 +422,29 @@ def show_duel_interface(duel_id, user_id):
     if st.button("Submit Guesses", key="submit_guesses"):
         duel["errors_found"][user_id] = st.session_state.selected_lines
         duel["submission_time"][user_id] = datetime.now(timezone.utc).isoformat()
-        save_state(state)
 
-        # Check if both users have submitted their guesses
-        if duel["submission_time"][user_id] and duel["submission_time"][opponent_id]:
+        if duel["is_bot_duel"]:
+            bot_errors = bot_find_errors(duel)
+            duel["errors_found"][opponent_id] = bot_errors
+            duel["submission_time"][opponent_id] = datetime.now(timezone.utc).isoformat()
+            save_state(state)
             determine_winner(duel_id)
             st.rerun()
         else:
-            st.info("Waiting for your opponent to submit their guesses...")
-            st.rerun()
+            save_state(state)
+            if duel["submission_time"][user_id] and duel["submission_time"][opponent_id]:
+                determine_winner(duel_id)
+                st.rerun()
+            else:
+                st.info("Waiting for your opponent to submit their guesses...")
+                st.rerun()
 
-        # Display opponent's progress
-    st.write(f"Opponent errors found: {len(duel['errors_found'][opponent_id])}")
+    # Display opponent's progress
+    if duel["is_bot_duel"]:
+        st.write("Bot will submit its guesses after you.")
+    else:
+        opponent_errors_found = len(duel['errors_found'][opponent_id]) if opponent_id in duel['errors_found'] else 0
+        st.write(f"Opponent errors found: {opponent_errors_found}")
 
 
 def determine_winner(duel_id):
@@ -367,8 +470,11 @@ def determine_winner(duel_id):
         # Handle tie
         duel["winner_id"] = "tie"
         save_state(state)
-        send_sse_event(user1_id, "duel_result", {"result": "tie"})
-        send_sse_event(user2_id, "duel_result", {"result": "tie"})
+        if duel["is_bot_duel"]:
+            send_sse_event(user1_id, "duel_result", {"result": "tie"})
+        else:
+            send_sse_event(user1_id, "duel_result", {"result": "tie"})
+            send_sse_event(user2_id, "duel_result", {"result": "tie"})
 
 
 def update_leaderboard(placeholder):
@@ -417,13 +523,26 @@ def main():
             if st.session_state.duel_id:
                 show_duel_interface(st.session_state.duel_id, user_id)
             elif not st.session_state.in_queue:
-                if st.button("Find Opponent", key="find_opponent"):
-                    state["queue"].append(user_id)
-                    save_state(state)
-                    st.session_state.in_queue = True
-                    st.rerun()
+                st.subheader("Choose Your Opponent")
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    if st.button("Find Human Opponent", key="find_opponent"):
+                        state["queue"].append(user_id)
+                        save_state(state)
+                        st.session_state.in_queue = True
+                        st.rerun()
+                with col2:
+                    if st.button("Play Against Easy Bot", key="easy_bot"):
+                        duel_id = create_bot_duel(user_id, BotDifficulty.EASY)
+                        st.session_state.duel_id = duel_id
+                        st.rerun()
+                with col3:
+                    if st.button("Play Against Hard Bot", key="hard_bot"):
+                        duel_id = create_bot_duel(user_id, BotDifficulty.HARD)
+                        st.session_state.duel_id = duel_id
+                        st.rerun()
             else:
-                st.info("Searching for an opponent...")
+                st.info("Searching for a human opponent...")
                 topic_placeholder = st.empty()
                 duel_id = find_opponent()
                 if duel_id:
@@ -484,9 +603,9 @@ def main():
 
     function handleDuelResult(data) {
         if (data.result === "win") {
-            alert("Congratulations! You won the duel!");
+            alert(`Congratulations! You won the duel! Rating change: ${data.rating_change}`);
         } else if (data.result === "lose") {
-            alert("You lost the duel. Better luck next time!");
+            alert(`You lost the duel. Better luck next time! Rating change: ${data.rating_change}`);
         } else if (data.result === "tie") {
             alert("The duel ended in a tie!");
         }
@@ -546,7 +665,7 @@ def main():
 
     // Check if in queue and start/stop topic update accordingly
     function checkQueueStatus() {
-        const inQueue = document.querySelector('div:contains("Searching for an opponent...")');
+        const inQueue = document.querySelector('div:contains("Searching for a human opponent...")');
         if (inQueue) {
             startTopicUpdate();
         } else {
@@ -569,7 +688,7 @@ def main():
             topic_placeholder.write(f"Current topic: {topic[0]} - {topic[1]}")
             st.rerun()
 
-    if time.time() - st.session_state.last_update > 15:  # Check every 10 seconds
+    if time.time() - st.session_state.last_update > 15:  # Check every 15 seconds
         st.session_state.last_update = time.time()
         st.rerun()
 
