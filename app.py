@@ -428,7 +428,7 @@ def main():
         if st.sidebar.button("Logout"):
             for key in list(st.session_state.keys()):
                 del st.session_state[key]
-            st.experimental_rerun()
+            st.rerun()
 
         user_id = st.session_state['user_id']
         state = get_current_state()
@@ -444,10 +444,10 @@ def main():
                 if update['type'] == 'new_duel':
                     st.session_state.duel_id = update['duel_id']
                     st.session_state.in_queue = False
-                    st.experimental_rerun()
+                    st.rerun()
                 elif update['type'] == 'duel_result':
                     st.session_state.duel_result = update
-                    st.experimental_rerun()
+                    st.rerun()
 
             # Display duel result if available
             if 'duel_result' in st.session_state:
@@ -463,7 +463,7 @@ def main():
                     del st.session_state['duel_result']
                     st.session_state.duel_id = None
                     st.session_state.selected_lines = []
-                    st.experimental_rerun()
+                    st.rerun()
                 return
 
             # Active duel, queue, or find opponent
@@ -479,7 +479,7 @@ def main():
                     state["queue"].append(user_id)
                     save_state(state)
                     st.session_state.in_queue = True
-                    st.experimental_rerun()
+                    st.rerun()
             else:
                 st.info("Searching for an opponent...")
                 topic_placeholder = st.empty()
@@ -487,12 +487,12 @@ def main():
                 if duel_id:
                     st.session_state.duel_id = duel_id
                     st.session_state.in_queue = False
-                    st.experimental_rerun()
+                    st.rerun()
                 elif st.button("Leave Queue", key="leave_queue"):
                     state["queue"] = [uid for uid in state["queue"] if uid != user_id]
                     save_state(state)
                     st.session_state.in_queue = False
-                    st.experimental_rerun()
+                    st.rerun()
 
             # Display leaderboard
             st.sidebar.write("---")
@@ -512,12 +512,12 @@ def main():
         else:
             st.error("User data not found. Please log in again.")
             st.session_state['user_id'] = None
-            st.experimental_rerun()
+            st.rerun()
 
     # Trigger rerun every second to check for updates
     if st.session_state.get('user_id'):
         time.sleep(1)
-        st.experimental_rerun()
+        st.rerun()
 
 if __name__ == "__main__":
     main()
