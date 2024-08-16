@@ -343,36 +343,35 @@ def determine_winner(duel_id):
         })
 
 
-def check_for_updates():
-    while True:
-        time.sleep(1)  # Check every second
-        state = load_state()
-        user_id = st.session_state.get('user_id')
+@st.cache_data(ttl=1)
+def get_current_state():
+    return load_state()
 
-        if user_id:
-            # Check for new duels
-            for duel_id, duel in state['duels'].items():
-                if user_id in [duel['user1_id'], duel['user2_id']] and duel['winner_id'] is None:
-                    if st.session_state.get('duel_id') != duel_id:
-                        update_queue.put({
-                            'type': 'new_duel',
-                            'duel_id': duel_id
-                        })
-                    break
 
-            # Check for duel results
-            active_duel_id = st.session_state.get('duel_id')
-            if active_duel_id and active_duel_id in state['duels']:
-                duel = state['duels'][active_duel_id]
-                if duel['winner_id']:
-                    result = 'win' if duel['winner_id'] == user_id else 'lose'
-                    if result == 'win':
-                        result = 'tie' if duel['winner_id'] == 'tie' else 'win'
-                    update_queue.put({
-                        'type': 'duel_result',
-                        'result': result,
-                        'new_rating': state['users'][user_id]['rating']
-                    })
+def check_for_updates(user_id):
+    state = get_current_state()
+
+    # Check for new duels
+    for duel_id, duel in state['duels'].items():
+        if user_id in [duel['user1_id'], duel['user2_id']] and duel['winner_id'] is None:
+            if st.session_state.get('duel_id') != duel_id:
+                return {'type': 'new_duel', 'duel_id': duel_id}
+
+    # Check for duel results
+    active_duel_id = st.session_state.get('duel_id')
+    if active_duel_id and active_duel_id in state['duels']:
+        duel = state['duels'][active_duel_id]
+        if duel['winner_id']:
+            result = 'win' if duel['winner_id'] == user_id else 'lose'
+            if duel['winner_id'] == 'tie':
+                result = 'tie'
+            return {
+                'type': 'duel_result',
+                'result': result,
+                'new_rating': state['users'][user_id]['rating']
+            }
+
+    return None
 
 
 def start_update_checker():
@@ -404,30 +403,20 @@ def get_random_topic():
 
 
 def main():
-    initialize_server_state()
-    start_update_checker()
-
     st.set_page_config(page_title="Debug Duel", page_icon="🐞", layout="wide")
     st.title("🐞 Debug Duel")
 
-    if 'duel_result' in st.session_state:
-        result = st.session_state.duel_result
-        if result['result'] == 'win':
-            st.success("Congratulations! You won the duel!")
-        elif result['result'] == 'tie':
-            st.info("The duel ended in a tie!")
-        else:
-            st.error("You lost the duel. Better luck next time!")
-        st.write(f"Your new rating: {result['new_rating']:.0f}")
-        if st.button("Start New Duel"):
-            del st.session_state['duel_result']
-            st.session_state.duel_id = None
-            st.session_state.selected_lines = []
-            st.rerun()
-        return
+    # Initialize session state variables if not present
+    if 'user_id' not in st.session_state:
+        st.session_state['user_id'] = None
+    if 'in_queue' not in st.session_state:
+        st.session_state.in_queue = False
+    if 'duel_id' not in st.session_state:
+        st.session_state.duel_id = None
+    if 'selected_lines' not in st.session_state:
+        st.session_state.selected_lines = []
 
-    state = load_state()
-
+    # User Authentication
     if not st.session_state['user_id']:
         col1, col2 = st.columns(2)
         with col1:
@@ -435,13 +424,49 @@ def main():
         with col2:
             register_user()
     else:
-        logout_user()
+        # Logout button
+        if st.sidebar.button("Logout"):
+            for key in list(st.session_state.keys()):
+                del st.session_state[key]
+            st.experimental_rerun()
+
         user_id = st.session_state['user_id']
+        state = get_current_state()
+
         if user_id in state["users"]:
             user = state["users"][user_id]
             st.sidebar.write(f"Player: {user['username']}")
             st.sidebar.write(f"Rating: {user['rating']:.0f}")
 
+            # Check for updates
+            update = check_for_updates(user_id)
+            if update:
+                if update['type'] == 'new_duel':
+                    st.session_state.duel_id = update['duel_id']
+                    st.session_state.in_queue = False
+                    st.experimental_rerun()
+                elif update['type'] == 'duel_result':
+                    st.session_state.duel_result = update
+                    st.experimental_rerun()
+
+            # Display duel result if available
+            if 'duel_result' in st.session_state:
+                result = st.session_state.duel_result
+                if result['result'] == 'win':
+                    st.success("Congratulations! You won the duel!")
+                elif result['result'] == 'tie':
+                    st.info("The duel ended in a tie!")
+                else:
+                    st.error("You lost the duel. Better luck next time!")
+                st.write(f"Your new rating: {result['new_rating']:.0f}")
+                if st.button("Start New Duel"):
+                    del st.session_state['duel_result']
+                    st.session_state.duel_id = None
+                    st.session_state.selected_lines = []
+                    st.experimental_rerun()
+                return
+
+            # Active duel, queue, or find opponent
             active_duel_id = check_for_active_duel(user_id)
             if active_duel_id:
                 st.session_state.duel_id = active_duel_id
@@ -454,7 +479,7 @@ def main():
                     state["queue"].append(user_id)
                     save_state(state)
                     st.session_state.in_queue = True
-                    st.rerun()
+                    st.experimental_rerun()
             else:
                 st.info("Searching for an opponent...")
                 topic_placeholder = st.empty()
@@ -462,35 +487,37 @@ def main():
                 if duel_id:
                     st.session_state.duel_id = duel_id
                     st.session_state.in_queue = False
-                    st.rerun()
+                    st.experimental_rerun()
                 elif st.button("Leave Queue", key="leave_queue"):
                     state["queue"] = [uid for uid in state["queue"] if uid != user_id]
                     save_state(state)
                     st.session_state.in_queue = False
-                    st.rerun()
+                    st.experimental_rerun()
+
+            # Display leaderboard
+            st.sidebar.write("---")
+            st.sidebar.write("Leaderboard:")
+            leaderboard = get_leaderboard()
+            for i, user in enumerate(leaderboard, 1):
+                st.sidebar.write(f"{i}. {user['username']}: {user['rating']:.0f}")
+
+            # Update current topic while in queue
+            if st.session_state.in_queue:
+                current_time = time.time()
+                if 'last_topic_update' not in st.session_state or current_time - st.session_state.last_topic_update > 1:
+                    st.session_state.last_topic_update = current_time
+                    topic = get_random_topic()
+                    topic_placeholder.write(f"Current topic: {topic[0]} - {topic[1]}")
 
         else:
             st.error("User data not found. Please log in again.")
             st.session_state['user_id'] = None
-            st.rerun()
+            st.experimental_rerun()
 
-    # Display leaderboard
-    st.sidebar.write("---")
-    st.sidebar.write("Leaderboard:")
-    leaderboard = get_leaderboard()
-    for i, user in enumerate(leaderboard, 1):
-        st.sidebar.write(f"{i}. {user['username']}: {user['rating']:.0f}")
-
-    # Periodically check for updates and update the topic
-    if st.session_state.in_queue:
-        current_time = time.time()
-        if 'last_topic_update' not in st.session_state or current_time - st.session_state.last_topic_update > 1:
-            st.session_state.last_topic_update = current_time
-            topic = get_random_topic()
-            topic_placeholder.write(f"Current topic: {topic[0]} - {topic[1]}")
-
-    process_updates()
-
+    # Trigger rerun every second to check for updates
+    if st.session_state.get('user_id'):
+        time.sleep(1)
+        st.experimental_rerun()
 
 if __name__ == "__main__":
     main()
