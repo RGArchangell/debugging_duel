@@ -496,8 +496,8 @@ def get_random_topic():
 def main():
     initialize_sse_events()
 
-    st.set_page_config(page_title="Debug Duel", page_icon="🐞", layout="wide")
-    st.title("🐞 Debug Duel")
+    st.set_page_config(page_title="Debug Duel", page_icon="👾", layout="wide")
+    st.title("👾 Debug Duel")
 
     state = load_state()
 
