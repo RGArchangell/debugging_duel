@@ -516,7 +516,7 @@ def main():
 
     # Trigger rerun every second to check for updates
     if st.session_state.get('user_id'):
-        time.sleep(1)
+        time.sleep(5)
         st.rerun()
 
 if __name__ == "__main__":
