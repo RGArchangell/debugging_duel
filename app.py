@@ -2,7 +2,6 @@ import streamlit as st
 import time
 from datetime import datetime, timezone
 import random
-import json
 import os
 from filelock import FileLock
 from streamlit_server_state import server_state, server_state_lock
@@ -11,6 +10,13 @@ from topics import TOPICS_LIST
 import bcrypt
 import secrets
 import logging
+import asyncio
+import websockets
+import json
+from streamlit.web.server.server import Server as StreamlitServer
+from streamlit.runtime.scriptrunner import add_script_run_ctx
+import threading
+from queue import Queue
 
 logging.basicConfig(level=logging.INFO)
 
@@ -158,6 +164,54 @@ class Duel:
         self.accepted_by = []
 
 
+websocket_queue = Queue()
+
+
+# WebSocket connection handler
+async def websocket_handler(websocket, path):
+    user_id = None
+    try:
+        async for message in websocket:
+            data = json.loads(message)
+            if data['type'] == 'init':
+                user_id = data['user_id']
+                # Associate this WebSocket connection with the user_id
+                server_state.websockets[user_id] = websocket
+            elif data['type'] == 'update':
+                # Handle other types of updates from the client
+                pass
+    finally:
+        if user_id:
+            del server_state.websockets[user_id]
+
+
+# Function to start WebSocket server
+def start_websocket_server():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    start_server = websockets.serve(websocket_handler, "localhost", 8765)
+    loop.run_until_complete(start_server)
+    loop.run_forever()
+
+
+# Function to send WebSocket messages
+async def send_websocket_message(user_id, message):
+    if user_id in server_state.websockets:
+        websocket = server_state.websockets[user_id]
+        await websocket.send(json.dumps(message))
+
+
+# Modify the initialize_sse_events function
+def initialize_server_state():
+    with server_state_lock["sse_events"]:
+        if "sse_events" not in server_state:
+            server_state.sse_events = {}
+    with server_state_lock["websockets"]:
+        if "websockets" not in server_state:
+            server_state.websockets = {}
+
+
+# Modify the find_opponent function
 def find_opponent():
     state = load_state()
     if len(state["queue"]) > 1:
@@ -166,6 +220,17 @@ def find_opponent():
         new_duel = Duel(user1_id, user2_id)
         state["duels"][new_duel.id] = new_duel.__dict__
         save_state(state)
+
+        # Notify both users about the new duel via WebSocket
+        for user_id in [user1_id, user2_id]:
+            websocket_queue.put({
+                'user_id': user_id,
+                'message': {
+                    'type': 'new_duel',
+                    'duel_id': new_duel.id
+                }
+            })
+
         return str(new_duel.id)
     return None
 
@@ -383,7 +448,12 @@ def get_random_topic():
 
 
 def main():
-    initialize_sse_events()
+    initialize_server_state()
+
+    # Start WebSocket server in a separate thread
+    websocket_thread = threading.Thread(target=start_websocket_server, daemon=True)
+    websocket_thread.start()
+    #initialize_sse_events()
 
     st.set_page_config(page_title="Debug Duel", page_icon="🐞", layout="wide")
     st.title("🐞 Debug Duel")
@@ -452,9 +522,98 @@ def main():
     leaderboard_placeholder = st.sidebar.empty()
     update_leaderboard(leaderboard_placeholder)
 
+    if not websocket_queue.empty():
+        message = websocket_queue.get()
+        asyncio.run(send_websocket_message(message['user_id'], message['message']))
+
     # Add JavaScript for SSE and real-time updates
     st.markdown("""
     <script>
+    const socket = new WebSocket('ws://localhost:8765');
+    
+    socket.onopen = function(event) {
+        console.log('WebSocket connection established');
+        // Send user_id to server for initialization
+        socket.send(JSON.stringify({
+            type: 'init',
+            user_id: getUserId() // Implement this function to get the current user's ID
+        }));
+    };
+    
+    socket.onmessage = function(event) {
+        const data = JSON.parse(event.data);
+        switch(data.type) {
+            case "duel_result":
+                handleDuelResult(data);
+                break;
+            case "leaderboard_update":
+                updateLeaderboard(data.leaderboard);
+                break;
+            case "duel_update":
+                updateDuelInterface(data);
+                break;
+            case "new_duel":
+                handleNewDuel(data);
+                break;
+            case "rating_update":
+                updatePersonalRating(data.new_rating);
+                break;
+        }
+    };
+    
+    socket.onerror = function(error) {
+        console.error('WebSocket error:', error);
+    };
+    
+    socket.onclose = function(event) {
+        console.log('WebSocket connection closed');
+    };
+    
+    function handleDuelResult(data) {
+        if (data.result === "win") {
+            alert("Congratulations! You won the duel!");
+        } else if (data.result === "lose") {
+            alert("You lost the duel. Better luck next time!");
+        } else if (data.result === "tie") {
+            alert("The duel ended in a tie!");
+        }
+        updatePersonalRating(data.new_rating);
+    }
+    
+    function updateLeaderboard(leaderboard) {
+        const leaderboardElement = document.querySelector('.element-container:contains("Leaderboard:")');
+        if (leaderboardElement) {
+            const leaderboardHtml = leaderboard.map((user, index) => 
+                `${index + 1}. ${user.username}: ${user.rating.toFixed(0)}`
+            ).join('<br>');
+            leaderboardElement.innerHTML = `<p>Leaderboard:</p>${leaderboardHtml}`;
+        }
+    }
+    
+    function updatePersonalRating(newRating) {
+        const ratingElement = document.querySelector('p:contains("Rating:")');
+        if (ratingElement) {
+            ratingElement.textContent = `Rating: ${newRating.toFixed(0)}`;
+        }
+    }
+    
+    function updateDuelInterface(data) {
+        const opponentErrorsElement = document.querySelector('p:contains("Opponent errors found:")');
+        if (opponentErrorsElement) {
+            opponentErrorsElement.textContent = `Opponent errors found: ${data.opponent_errors}`;
+        }
+    }
+    
+    function handleNewDuel(data) {
+        alert("Opponent found! The duel is starting.");
+        location.reload();
+    }
+    
+    function getUserId() {
+        // Implement this function to retrieve the current user's ID
+        // You might need to store this in a hidden input field or in localStorage
+        return document.getElementById('user-id').value;
+    }
     const evtSource = new EventSource("/stream");
     evtSource.onmessage = function(event) {
         const data = JSON.parse(event.data);
@@ -564,11 +723,10 @@ def main():
             topic_placeholder.write(f"Current topic: {topic[0]} - {topic[1]}")
             st.rerun()
 
-    if time.time() - st.session_state.last_update > 15:  # Check every 10 seconds
+    if time.time() - st.session_state.last_update > 10:  # Check every 10 seconds
         st.session_state.last_update = time.time()
         st.rerun()
 
 
 if __name__ == "__main__":
-    initialize_sse_events()
     main()
