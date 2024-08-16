@@ -32,6 +32,8 @@ if 'last_update' not in st.session_state:
     st.session_state.last_update = time.time()
 if 'secret_key' not in st.session_state:
     st.session_state['secret_key'] = secrets.token_hex(16)
+if 'current_topic' not in st.session_state:
+    st.session_state.current_topic = random.choice(TOPICS_LIST)
 
 
 def load_state():
@@ -152,6 +154,7 @@ class Duel:
         self.code_snippet, self.error_lines = generate_code_snippet()
         self.start_time = datetime.now(timezone.utc).isoformat()
         self.errors_found = {user1_id: [], user2_id: []}
+        self.submission_time = {user1_id: None, user2_id: None}
         self.accepted_by = []
 
 
@@ -269,12 +272,16 @@ def show_duel_interface(duel_id, user_id):
     if duel["winner_id"]:
         if duel["winner_id"] == user_id:
             st.success("Congratulations! You won the duel!")
+        elif duel["winner_id"] == "tie":
+            st.info("The duel ended in a tie!")
         else:
-            st.error(f"The duel has ended. {opponent['username']} found all the errors first.")
+            st.error(f"The duel has ended. {opponent['username']} found more correct errors.")
 
         st.write("Final results:")
-        st.write(f"Your errors found: {len(duel['errors_found'][user_id])}")
-        st.write(f"Opponent errors found: {len(duel['errors_found'][opponent_id])}")
+        st.write(f"Your correct errors: {len([e for e in duel['errors_found'][user_id] if e in duel['error_lines']])}")
+        st.write(f"Your incorrect errors: {len([e for e in duel['errors_found'][user_id] if e not in duel['error_lines']])}")
+        st.write(f"Opponent correct errors: {len([e for e in duel['errors_found'][opponent_id] if e in duel['error_lines']])}")
+        st.write(f"Opponent incorrect errors: {len([e for e in duel['errors_found'][opponent_id] if e not in duel['error_lines']])}")
 
         if st.button("Start New Duel"):
             st.session_state.duel_id = None
@@ -317,50 +324,46 @@ def show_duel_interface(duel_id, user_id):
 
     if st.button("Submit Guesses", key="submit_guesses"):
         duel["errors_found"][user_id] = st.session_state.selected_lines
+        duel["submission_time"][user_id] = datetime.now(timezone.utc).isoformat()
         save_state(state)
 
-        if set(duel["errors_found"][user_id]) == set(duel["error_lines"]):
-            end_duel(duel_id, user_id)
-            st.success("Congratulations! You found all the errors and won the duel!")
-            st.rerun()  # Force a rerun to update the interface
+        # Check if both users have submitted their guesses
+        if duel["submission_time"][user_id] and duel["submission_time"][opponent_id]:
+            determine_winner(duel_id)
+            st.rerun()
         else:
-            correct_errors = [line for line in duel["errors_found"][user_id] if line in duel["error_lines"]]
-            st.write("Correct errors found:", ", ".join(map(str, sorted(correct_errors))))
+            st.info("Waiting for your opponent to submit their guesses...")
+            st.rerun()
 
-            # Check if the opponent has won
-            if set(duel["errors_found"][opponent_id]) == set(duel["error_lines"]):
-                end_duel(duel_id, opponent_id)
-                st.error("Your opponent found all the errors first. Better luck next time!")
-                st.rerun()  # Force a rerun to update the interface
-
-    # Display opponent's progress
+        # Display opponent's progress
     st.write(f"Opponent errors found: {len(duel['errors_found'][opponent_id])}")
 
 
-def check_for_duel_updates(duel_id, user_id):
+def determine_winner(duel_id):
     state = load_state()
     duel = state["duels"][duel_id]
-    opponent_id = duel["user2_id"] if user_id == duel["user1_id"] else duel["user1_id"]
+    user1_id, user2_id = duel["user1_id"], duel["user2_id"]
 
-    # Check if opponent has made any new moves
-    if duel["errors_found"][opponent_id] != st.session_state.get("last_opponent_errors", []):
-        st.session_state.last_opponent_errors = duel["errors_found"][opponent_id]
-        send_sse_event(user_id, "duel_update", {
-            "opponent_errors": len(duel["errors_found"][opponent_id])
-        })
+    user1_correct = len([e for e in duel['errors_found'][user1_id] if e in duel['error_lines']])
+    user1_incorrect = len([e for e in duel['errors_found'][user1_id] if e not in duel['error_lines']])
+    user2_correct = len([e for e in duel['errors_found'][user2_id] if e in duel['error_lines']])
+    user2_incorrect = len([e for e in duel['errors_found'][user2_id] if e not in duel['error_lines']])
 
-    # Check if the duel has ended
-    if duel["winner_id"] and duel["winner_id"] != st.session_state.get("last_winner"):
-        st.session_state.last_winner = duel["winner_id"]
-        send_sse_event(user_id, "duel_result", {
-            "result": "win" if duel["winner_id"] == user_id else "lose",
-            "new_rating": state["users"][user_id]["rating"]
-        })
+    if user1_correct > user2_correct or (user1_correct == user2_correct and user1_incorrect < user2_incorrect):
+        winner_id = user1_id
+    elif user2_correct > user1_correct or (user1_correct == user2_correct and user2_incorrect < user1_incorrect):
+        winner_id = user2_id
+    else:
+        winner_id = None  # It's a tie
 
-    # If any updates were made, trigger a rerun
-    if st.session_state.get("last_opponent_errors") != duel["errors_found"][opponent_id] or \
-            st.session_state.get("last_winner") != duel["winner_id"]:
-        st.rerun()
+    if winner_id:
+        end_duel(duel_id, winner_id)
+    else:
+        # Handle tie
+        duel["winner_id"] = "tie"
+        save_state(state)
+        send_sse_event(user1_id, "duel_result", {"result": "tie"})
+        send_sse_event(user2_id, "duel_result", {"result": "tie"})
 
 
 def update_leaderboard(placeholder):
@@ -373,6 +376,10 @@ def initialize_sse_events():
     with server_state_lock["sse_events"]:
         if "sse_events" not in server_state:
             server_state.sse_events = {}
+
+
+def get_random_topic():
+    return random.choice(TOPICS_LIST)
 
 
 def main():
@@ -412,6 +419,7 @@ def main():
                     st.rerun()
             else:
                 st.info("Searching for an opponent...")
+                topic_placeholder = st.empty()
                 duel_id = find_opponent()
                 if duel_id:
                     st.session_state.duel_id = duel_id
@@ -468,16 +476,18 @@ def main():
                 break;
         }
     }
-    
+
     function handleDuelResult(data) {
         if (data.result === "win") {
             alert("Congratulations! You won the duel!");
-        } else {
+        } else if (data.result === "lose") {
             alert("You lost the duel. Better luck next time!");
+        } else if (data.result === "tie") {
+            alert("The duel ended in a tie!");
         }
         updatePersonalRating(data.new_rating);
     }
-    
+
     function updateLeaderboard(leaderboard) {
         const leaderboardElement = document.querySelector('.element-container:contains("Leaderboard:")');
         if (leaderboardElement) {
@@ -487,7 +497,7 @@ def main():
             leaderboardElement.innerHTML = `<p>Leaderboard:</p>${leaderboardHtml}`;
         }
     }
-    
+
     function updatePersonalRating(newRating) {
         const ratingElement = document.querySelector('p:contains("Rating:")');
         if (ratingElement) {
@@ -506,11 +516,55 @@ def main():
         alert("Opponent found! The duel is starting.");
         location.reload();
     }
+
+    // Function to update the current topic with blinking effect
+    function updateTopic() {
+        const topicElement = document.querySelector('div[data-testid="stText"] p:contains("Current topic:")');
+        if (topicElement) {
+            topicElement.style.transition = 'opacity 0.5s';
+            topicElement.style.opacity = 0;
+            setTimeout(() => {
+                topicElement.style.opacity = 1;
+            }, 500);
+        }
+    }
+
+    // Update topic every second while in queue
+    let topicInterval;
+    function startTopicUpdate() {
+        topicInterval = setInterval(updateTopic, 1000);
+    }
+
+    function stopTopicUpdate() {
+        clearInterval(topicInterval);
+    }
+
+    // Check if in queue and start/stop topic update accordingly
+    function checkQueueStatus() {
+        const inQueue = document.querySelector('div:contains("Searching for an opponent...")');
+        if (inQueue) {
+            startTopicUpdate();
+        } else {
+            stopTopicUpdate();
+        }
+    }
+
+    // Initial check and periodic check for queue status
+    checkQueueStatus();
+    setInterval(checkQueueStatus, 1000);
     </script>
     """, unsafe_allow_html=True)
 
-    # Periodically check for updates
-    if time.time() - st.session_state.last_update > 10:  # Check every 5 seconds
+    # Periodically check for updates and update the topic
+    if st.session_state.in_queue:
+        current_time = time.time()
+        if 'last_topic_update' not in st.session_state or current_time - st.session_state.last_topic_update > 1:
+            st.session_state.last_topic_update = current_time
+            topic = get_random_topic()
+            topic_placeholder.write(f"Current topic: {topic[0]} - {topic[1]}")
+            st.rerun()
+
+    if time.time() - st.session_state.last_update > 15:  # Check every 10 seconds
         st.session_state.last_update = time.time()
         st.rerun()
 
