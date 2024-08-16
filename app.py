@@ -6,6 +6,8 @@ import json
 import os
 from filelock import FileLock
 from streamlit_server_state import server_state, server_state_lock
+from hyperskill_ai_api import HyperskillAIAPI
+from topics import TOPICS_LIST
 import bcrypt
 import secrets
 import logging
@@ -14,6 +16,8 @@ logging.basicConfig(level=logging.INFO)
 
 DATA_FILE = "game_state.json"
 LOCK_FILE = "game_state.lock"
+
+ai_api = HyperskillAIAPI(os.environ["AI_API_KEY"], "claude-3-5-sonnet-20240620")
 
 # Initialize session state variables
 if 'user_id' not in st.session_state:
@@ -106,28 +110,36 @@ def logout_user():
 
 
 def generate_code_snippet():
-    snippets = [
-        ("""
-def calculate_sum(a, b):
-    return a - b  # Error: should be addition
+    topic = random.choice(TOPICS_LIST)
 
-result = calculates_um(5, 3)  # Error: function name is incorrect
-print("The sum is: " + result)  # Error: result is int, not string
-        """, [2, 4, 5]),
-        ("""
-def find_max(numbers):
-    max_num = numbers[0]
-    for num in numbers
-        if num > max_num:
-            max_num = num
-    return max_num
+    system_prompt = f"""
+    You are a mischievous coding assistant tasked with creating intentionally flawed code snippets. Your goal is to generate a code snippet on the specified {topic[0]} using the {topic[1]}. However, you MUST introduce EXACTLY THREE BUGS into the code that are DIRECTLY RELATED to the given topic. These bugs should be subtle enough to not be immediately obvious, but significant enough to cause issues when the code is run or implemented.
+    """
+    user_prompt = f"""
+    Do not provide any explanations, comments, or annotations within the code. Output only the raw code snippet with the embedded bugs. The bugs should be logical errors, syntax mistakes, or implementation flaws that are specific to the topic and programming language provided.
+    
+    Remember, your task is to create code that appears functional at first glance but contains hidden flaws. Be creative in your bug placement, ensuring they are diverse and not trivially fixable. The code should compile (if applicable to the language) but fail or produce incorrect results when executed.
+    DO NOT write empty lines in the code snippet!
+    After generated code, explain the errors in generated code snippet in the following format:
+    **BUGS LIST**
+    Line number: correct implementation for this line (with fixed bug)
+    DO NOT WRITE ANYTHING OTHER THAN THAT!
+    Remember: there are EXACLTY 3 LINES WITH BUGS! NO MORE!
+    """
 
-numbers = [1, 5, 3, 8, 2]
-result = findmax(numbers)
-print(f"The maximum number is: {results}")
-        """, [4, 9, 10])
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
     ]
-    return random.choice(snippets)
+
+    result = ai_api.get_chat_completion(messages)
+    code_part, bugs_part = result.split("**BUGS LIST**")
+
+    bug_lines = []
+    for line in bugs_part.strip().split('\n'):
+        line_number = int(line.split(':')[0].split()[-1])
+        bug_lines.append(line_number)
+    return code_part.strip(), bug_lines
 
 
 class Duel:
@@ -489,7 +501,7 @@ def main():
     """, unsafe_allow_html=True)
 
     # Periodically check for updates
-    if time.time() - st.session_state.last_update > 5:  # Check every 5 seconds
+    if time.time() - st.session_state.last_update > 10:  # Check every 5 seconds
         st.session_state.last_update = time.time()
         st.rerun()
 
