@@ -2,6 +2,7 @@ import streamlit as st
 import time
 from datetime import datetime, timezone
 import random
+import json
 import os
 from filelock import FileLock
 from streamlit_server_state import server_state, server_state_lock
@@ -10,10 +11,6 @@ from topics import TOPICS_LIST
 import bcrypt
 import secrets
 import logging
-import asyncio
-import websockets
-import json
-from streamlit.web.server.server import Server as StreamlitServer
 from streamlit.runtime.scriptrunner import add_script_run_ctx
 import threading
 from queue import Queue
@@ -40,6 +37,9 @@ if 'secret_key' not in st.session_state:
     st.session_state['secret_key'] = secrets.token_hex(16)
 if 'current_topic' not in st.session_state:
     st.session_state.current_topic = random.choice(TOPICS_LIST)
+
+# Initialize update queue
+update_queue = Queue()
 
 
 def load_state():
@@ -125,7 +125,7 @@ def generate_code_snippet():
     """
     user_prompt = f"""
     Do not provide any explanations, comments, or annotations within the code. Output only the raw code snippet with the embedded bugs. The bugs should be logical errors, syntax mistakes, or implementation flaws that are specific to the topic and programming language provided.
-    
+
     Remember, your task is to create code that appears functional at first glance but contains hidden flaws. Be creative in your bug placement, ensuring they are diverse and not trivially fixable. The code should compile (if applicable to the language) but fail or produce incorrect results when executed.
     DO NOT write empty lines in the code snippet!
     MAXIMUM AMOUNT OF LINES IN CODE SNIPPET: 10. NO MORE!
@@ -164,54 +164,6 @@ class Duel:
         self.accepted_by = []
 
 
-websocket_queue = Queue()
-
-
-# WebSocket connection handler
-async def websocket_handler(websocket, path):
-    user_id = None
-    try:
-        async for message in websocket:
-            data = json.loads(message)
-            if data['type'] == 'init':
-                user_id = data['user_id']
-                # Associate this WebSocket connection with the user_id
-                server_state.websockets[user_id] = websocket
-            elif data['type'] == 'update':
-                # Handle other types of updates from the client
-                pass
-    finally:
-        if user_id:
-            del server_state.websockets[user_id]
-
-
-# Function to start WebSocket server
-def start_websocket_server():
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    start_server = websockets.serve(websocket_handler, "localhost", 8765)
-    loop.run_until_complete(start_server)
-    loop.run_forever()
-
-
-# Function to send WebSocket messages
-async def send_websocket_message(user_id, message):
-    if user_id in server_state.websockets:
-        websocket = server_state.websockets[user_id]
-        await websocket.send(json.dumps(message))
-
-
-# Modify the initialize_sse_events function
-def initialize_server_state():
-    with server_state_lock["sse_events"]:
-        if "sse_events" not in server_state:
-            server_state.sse_events = {}
-    with server_state_lock["websockets"]:
-        if "websockets" not in server_state:
-            server_state.websockets = {}
-
-
-# Modify the find_opponent function
 def find_opponent():
     state = load_state()
     if len(state["queue"]) > 1:
@@ -220,17 +172,6 @@ def find_opponent():
         new_duel = Duel(user1_id, user2_id)
         state["duels"][new_duel.id] = new_duel.__dict__
         save_state(state)
-
-        # Notify both users about the new duel via WebSocket
-        for user_id in [user1_id, user2_id]:
-            websocket_queue.put({
-                'user_id': user_id,
-                'message': {
-                    'type': 'new_duel',
-                    'duel_id': new_duel.id
-                }
-            })
-
         return str(new_duel.id)
     return None
 
@@ -241,13 +182,6 @@ def check_for_active_duel(user_id):
         if user_id in [duel["user1_id"], duel["user2_id"]] and duel["winner_id"] is None:
             return duel_id
     return None
-
-def send_sse_event(user_id, event_type, data):
-    with server_state_lock["sse_events"]:
-        server_state.sse_events[user_id] = json.dumps({
-            "type": event_type,
-            **data
-        })
 
 
 def end_duel(duel_id, winner_id):
@@ -265,30 +199,23 @@ def end_duel(duel_id, winner_id):
     logging.info(f"Winner rating: {winner_rating_before} -> {winner_rating}")
     logging.info(f"Loser rating: {loser_rating_before} -> {loser_rating}")
 
-    # Update the state with new ratings
     state["users"][winner_id]["rating"] = winner_rating
     state["users"][loser_id]["rating"] = loser_rating
     duel["winner_id"] = winner_id
 
     save_state(state)
 
-    # Verify the state was saved correctly
     verification_state = load_state()
     logging.info(f"Verified winner rating: {verification_state['users'][winner_id]['rating']}")
     logging.info(f"Verified loser rating: {verification_state['users'][loser_id]['rating']}")
 
-    # Notify both users about the duel result and updated ratings
-    send_sse_event(winner_id, "duel_result", {
-        "result": "win",
-        "new_rating": winner_rating
+    update_queue.put({
+        'type': 'duel_result',
+        'winner_id': winner_id,
+        'loser_id': loser_id,
+        'winner_rating': winner_rating,
+        'loser_rating': loser_rating
     })
-    send_sse_event(loser_id, "duel_result", {
-        "result": "lose",
-        "new_rating": loser_rating
-    })
-
-    # Update leaderboard for all users
-    update_leaderboard_for_all_users()
 
 
 def update_ratings(winner_id, loser_id):
@@ -308,19 +235,6 @@ def update_ratings(winner_id, loser_id):
     return new_winner_rating, new_loser_rating
 
 
-def update_leaderboard_for_all_users():
-    state = load_state()  # Ensure we're using the most recent state
-    leaderboard = get_leaderboard()
-    logging.info(f"Updating leaderboard: {leaderboard}")
-    for user_id in state["users"]:
-        send_sse_event(user_id, "leaderboard_update", {
-            "leaderboard": leaderboard
-        })
-        # Also send an update for the user's personal rating
-        send_sse_event(user_id, "rating_update", {
-            "new_rating": state["users"][user_id]["rating"]
-        })
-
 def get_leaderboard():
     state = load_state()
     sorted_users = sorted(state["users"].values(), key=lambda x: x["rating"], reverse=True)
@@ -333,7 +247,6 @@ def show_duel_interface(duel_id, user_id):
     opponent_id = duel["user2_id"] if user_id == duel["user1_id"] else duel["user1_id"]
     opponent = state["users"][opponent_id]
 
-    # Check if the duel has already ended
     if duel["winner_id"]:
         if duel["winner_id"] == user_id:
             st.success("Congratulations! You won the duel!")
@@ -344,19 +257,18 @@ def show_duel_interface(duel_id, user_id):
 
         st.write("Final results:")
         st.write(f"Your correct errors: {len([e for e in duel['errors_found'][user_id] if e in duel['error_lines']])}")
-        st.write(f"Your incorrect errors: {len([e for e in duel['errors_found'][user_id] if e not in duel['error_lines']])}")
-        st.write(f"Opponent correct errors: {len([e for e in duel['errors_found'][opponent_id] if e in duel['error_lines']])}")
-        st.write(f"Opponent incorrect errors: {len([e for e in duel['errors_found'][opponent_id] if e not in duel['error_lines']])}")
+        st.write(
+            f"Your incorrect errors: {len([e for e in duel['errors_found'][user_id] if e not in duel['error_lines']])}")
+        st.write(
+            f"Opponent correct errors: {len([e for e in duel['errors_found'][opponent_id] if e in duel['error_lines']])}")
+        st.write(
+            f"Opponent incorrect errors: {len([e for e in duel['errors_found'][opponent_id] if e not in duel['error_lines']])}")
 
         if st.button("Start New Duel"):
             st.session_state.duel_id = None
             st.session_state.selected_lines = []
             st.rerun()
         return
-
-    # Initialize selected_lines if not present
-    if "selected_lines" not in st.session_state:
-        st.session_state.selected_lines = []
 
     col1, col2 = st.columns(2)
     with col1:
@@ -367,7 +279,6 @@ def show_duel_interface(duel_id, user_id):
 
     st.write("Find bugs in the following code before your opponent does!")
 
-    # Display unified code block
     st.code(duel["code_snippet"].strip(), language="cpp")
 
     st.write("Select the lines containing errors:")
@@ -392,7 +303,6 @@ def show_duel_interface(duel_id, user_id):
         duel["submission_time"][user_id] = datetime.now(timezone.utc).isoformat()
         save_state(state)
 
-        # Check if both users have submitted their guesses
         if duel["submission_time"][user_id] and duel["submission_time"][opponent_id]:
             determine_winner(duel_id)
             st.rerun()
@@ -400,7 +310,6 @@ def show_duel_interface(duel_id, user_id):
             st.info("Waiting for your opponent to submit their guesses...")
             st.rerun()
 
-        # Display opponent's progress
     st.write(f"Opponent errors found: {len(duel['errors_found'][opponent_id])}")
 
 
@@ -419,25 +328,72 @@ def determine_winner(duel_id):
     elif user2_correct > user1_correct or (user1_correct == user2_correct and user2_incorrect < user1_incorrect):
         winner_id = user2_id
     else:
-        winner_id = None  # It's a tie
+        winner_id = "tie"
 
-    if winner_id:
+    if winner_id != "tie":
         end_duel(duel_id, winner_id)
     else:
         # Handle tie
         duel["winner_id"] = "tie"
         save_state(state)
-        send_sse_event(user1_id, "duel_result", {"result": "tie"})
-        send_sse_event(user2_id, "duel_result", {"result": "tie"})
+        update_queue.put({
+            'type': 'duel_result',
+            'result': 'tie',
+            'duel_id': duel_id
+        })
 
 
-def update_leaderboard(placeholder):
-    leaderboard = get_leaderboard()
-    placeholder.write(
-        "\n".join([f"{i + 1}. {user['username']}: {user['rating']:.0f}" for i, user in enumerate(leaderboard)]))
+def check_for_updates():
+    while True:
+        time.sleep(1)  # Check every second
+        state = load_state()
+        user_id = st.session_state.get('user_id')
+
+        if user_id:
+            # Check for new duels
+            for duel_id, duel in state['duels'].items():
+                if user_id in [duel['user1_id'], duel['user2_id']] and duel['winner_id'] is None:
+                    if st.session_state.get('duel_id') != duel_id:
+                        update_queue.put({
+                            'type': 'new_duel',
+                            'duel_id': duel_id
+                        })
+                    break
+
+            # Check for duel results
+            active_duel_id = st.session_state.get('duel_id')
+            if active_duel_id and active_duel_id in state['duels']:
+                duel = state['duels'][active_duel_id]
+                if duel['winner_id']:
+                    result = 'win' if duel['winner_id'] == user_id else 'lose'
+                    if result == 'win':
+                        result = 'tie' if duel['winner_id'] == 'tie' else 'win'
+                    update_queue.put({
+                        'type': 'duel_result',
+                        'result': result,
+                        'new_rating': state['users'][user_id]['rating']
+                    })
 
 
-def initialize_sse_events():
+def start_update_checker():
+    update_thread = threading.Thread(target=check_for_updates, daemon=True)
+    add_script_run_ctx(update_thread)
+    update_thread.start()
+
+
+def process_updates():
+    while not update_queue.empty():
+        update = update_queue.get()
+        if update['type'] == 'new_duel':
+            st.session_state.duel_id = update['duel_id']
+            st.session_state.in_queue = False
+            st.rerun()
+        elif update['type'] == 'duel_result':
+            st.session_state.duel_result = update
+            st.rerun()
+
+
+def initialize_server_state():
     with server_state_lock["sse_events"]:
         if "sse_events" not in server_state:
             server_state.sse_events = {}
@@ -449,14 +405,26 @@ def get_random_topic():
 
 def main():
     initialize_server_state()
-
-    # Start WebSocket server in a separate thread
-    websocket_thread = threading.Thread(target=start_websocket_server, daemon=True)
-    websocket_thread.start()
-    #initialize_sse_events()
+    start_update_checker()
 
     st.set_page_config(page_title="Debug Duel", page_icon="🐞", layout="wide")
     st.title("🐞 Debug Duel")
+
+    if 'duel_result' in st.session_state:
+        result = st.session_state.duel_result
+        if result['result'] == 'win':
+            st.success("Congratulations! You won the duel!")
+        elif result['result'] == 'tie':
+            st.info("The duel ended in a tie!")
+        else:
+            st.error("You lost the duel. Better luck next time!")
+        st.write(f"Your new rating: {result['new_rating']:.0f}")
+        if st.button("Start New Duel"):
+            del st.session_state['duel_result']
+            st.session_state.duel_id = None
+            st.session_state.selected_lines = []
+            st.rerun()
+        return
 
     state = load_state()
 
@@ -494,16 +462,6 @@ def main():
                 if duel_id:
                     st.session_state.duel_id = duel_id
                     st.session_state.in_queue = False
-                    # Notify both users about the new duel
-                    with server_state_lock["sse_events"]:
-                        duel = state["duels"].get(duel_id)
-                        if duel:
-                            for participant_id in [duel["user1_id"], duel["user2_id"]]:
-                                if participant_id:
-                                    server_state.sse_events[participant_id] = json.dumps(
-                                        {"type": "new_duel", "duel_id": duel_id})
-                        else:
-                            st.error(f"Duel with id {duel_id} not found in state.")
                     st.rerun()
                 elif st.button("Leave Queue", key="leave_queue"):
                     state["queue"] = [uid for uid in state["queue"] if uid != user_id]
@@ -519,200 +477,9 @@ def main():
     # Display leaderboard
     st.sidebar.write("---")
     st.sidebar.write("Leaderboard:")
-    leaderboard_placeholder = st.sidebar.empty()
-    update_leaderboard(leaderboard_placeholder)
-
-    if not websocket_queue.empty():
-        message = websocket_queue.get()
-        asyncio.run(send_websocket_message(message['user_id'], message['message']))
-
-    # Add JavaScript for SSE and real-time updates
-    st.markdown("""
-    <script>
-    const socket = new WebSocket('ws://localhost:8765');
-    
-    socket.onopen = function(event) {
-        console.log('WebSocket connection established');
-        // Send user_id to server for initialization
-        socket.send(JSON.stringify({
-            type: 'init',
-            user_id: getUserId() // Implement this function to get the current user's ID
-        }));
-    };
-    
-    socket.onmessage = function(event) {
-        const data = JSON.parse(event.data);
-        switch(data.type) {
-            case "duel_result":
-                handleDuelResult(data);
-                break;
-            case "leaderboard_update":
-                updateLeaderboard(data.leaderboard);
-                break;
-            case "duel_update":
-                updateDuelInterface(data);
-                break;
-            case "new_duel":
-                handleNewDuel(data);
-                break;
-            case "rating_update":
-                updatePersonalRating(data.new_rating);
-                break;
-        }
-    };
-    
-    socket.onerror = function(error) {
-        console.error('WebSocket error:', error);
-    };
-    
-    socket.onclose = function(event) {
-        console.log('WebSocket connection closed');
-    };
-    
-    function handleDuelResult(data) {
-        if (data.result === "win") {
-            alert("Congratulations! You won the duel!");
-        } else if (data.result === "lose") {
-            alert("You lost the duel. Better luck next time!");
-        } else if (data.result === "tie") {
-            alert("The duel ended in a tie!");
-        }
-        updatePersonalRating(data.new_rating);
-    }
-    
-    function updateLeaderboard(leaderboard) {
-        const leaderboardElement = document.querySelector('.element-container:contains("Leaderboard:")');
-        if (leaderboardElement) {
-            const leaderboardHtml = leaderboard.map((user, index) => 
-                `${index + 1}. ${user.username}: ${user.rating.toFixed(0)}`
-            ).join('<br>');
-            leaderboardElement.innerHTML = `<p>Leaderboard:</p>${leaderboardHtml}`;
-        }
-    }
-    
-    function updatePersonalRating(newRating) {
-        const ratingElement = document.querySelector('p:contains("Rating:")');
-        if (ratingElement) {
-            ratingElement.textContent = `Rating: ${newRating.toFixed(0)}`;
-        }
-    }
-    
-    function updateDuelInterface(data) {
-        const opponentErrorsElement = document.querySelector('p:contains("Opponent errors found:")');
-        if (opponentErrorsElement) {
-            opponentErrorsElement.textContent = `Opponent errors found: ${data.opponent_errors}`;
-        }
-    }
-    
-    function handleNewDuel(data) {
-        alert("Opponent found! The duel is starting.");
-        location.reload();
-    }
-    
-    function getUserId() {
-        // Implement this function to retrieve the current user's ID
-        // You might need to store this in a hidden input field or in localStorage
-        return document.getElementById('user-id').value;
-    }
-    const evtSource = new EventSource("/stream");
-    evtSource.onmessage = function(event) {
-        const data = JSON.parse(event.data);
-        switch(data.type) {
-            case "duel_result":
-                handleDuelResult(data);
-                break;
-            case "leaderboard_update":
-                updateLeaderboard(data.leaderboard);
-                break;
-            case "duel_update":
-                updateDuelInterface(data);
-                break;
-            case "new_duel":
-                handleNewDuel(data);
-                break;
-            case "rating_update":
-                updatePersonalRating(data.new_rating);
-                break;
-        }
-    }
-
-    function handleDuelResult(data) {
-        if (data.result === "win") {
-            alert("Congratulations! You won the duel!");
-        } else if (data.result === "lose") {
-            alert("You lost the duel. Better luck next time!");
-        } else if (data.result === "tie") {
-            alert("The duel ended in a tie!");
-        }
-        updatePersonalRating(data.new_rating);
-    }
-
-    function updateLeaderboard(leaderboard) {
-        const leaderboardElement = document.querySelector('.element-container:contains("Leaderboard:")');
-        if (leaderboardElement) {
-            const leaderboardHtml = leaderboard.map((user, index) => 
-                `${index + 1}. ${user.username}: ${user.rating.toFixed(0)}`
-            ).join('<br>');
-            leaderboardElement.innerHTML = `<p>Leaderboard:</p>${leaderboardHtml}`;
-        }
-    }
-
-    function updatePersonalRating(newRating) {
-        const ratingElement = document.querySelector('p:contains("Rating:")');
-        if (ratingElement) {
-            ratingElement.textContent = `Rating: ${newRating.toFixed(0)}`;
-        }
-    }
-
-    function updateDuelInterface(data) {
-        const opponentErrorsElement = document.querySelector('p:contains("Opponent errors found:")');
-        if (opponentErrorsElement) {
-            opponentErrorsElement.textContent = `Opponent errors found: ${data.opponent_errors}`;
-        }
-    }
-
-    function handleNewDuel(data) {
-        alert("Opponent found! The duel is starting.");
-        location.reload();
-    }
-
-    // Function to update the current topic with blinking effect
-    function updateTopic() {
-        const topicElement = document.querySelector('div[data-testid="stText"] p:contains("Current topic:")');
-        if (topicElement) {
-            topicElement.style.transition = 'opacity 0.5s';
-            topicElement.style.opacity = 0;
-            setTimeout(() => {
-                topicElement.style.opacity = 1;
-            }, 500);
-        }
-    }
-
-    // Update topic every second while in queue
-    let topicInterval;
-    function startTopicUpdate() {
-        topicInterval = setInterval(updateTopic, 1000);
-    }
-
-    function stopTopicUpdate() {
-        clearInterval(topicInterval);
-    }
-
-    // Check if in queue and start/stop topic update accordingly
-    function checkQueueStatus() {
-        const inQueue = document.querySelector('div:contains("Searching for an opponent...")');
-        if (inQueue) {
-            startTopicUpdate();
-        } else {
-            stopTopicUpdate();
-        }
-    }
-
-    // Initial check and periodic check for queue status
-    checkQueueStatus();
-    setInterval(checkQueueStatus, 1000);
-    </script>
-    """, unsafe_allow_html=True)
+    leaderboard = get_leaderboard()
+    for i, user in enumerate(leaderboard, 1):
+        st.sidebar.write(f"{i}. {user['username']}: {user['rating']:.0f}")
 
     # Periodically check for updates and update the topic
     if st.session_state.in_queue:
@@ -721,11 +488,8 @@ def main():
             st.session_state.last_topic_update = current_time
             topic = get_random_topic()
             topic_placeholder.write(f"Current topic: {topic[0]} - {topic[1]}")
-            st.rerun()
 
-    if time.time() - st.session_state.last_update > 10:  # Check every 10 seconds
-        st.session_state.last_update = time.time()
-        st.rerun()
+    process_updates()
 
 
 if __name__ == "__main__":
