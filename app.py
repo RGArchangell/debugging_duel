@@ -120,6 +120,7 @@ def generate_code_snippet():
     
     Remember, your task is to create code that appears functional at first glance but contains hidden flaws. Be creative in your bug placement, ensuring they are diverse and not trivially fixable. The code should compile (if applicable to the language) but fail or produce incorrect results when executed.
     DO NOT write empty lines in the code snippet!
+    MAXIMUM AMOUNT OF LINES IN CODE SNIPPET: 10. NO MORE!
     After generated code, explain the errors in generated code snippet in the following format:
     **BUGS LIST**
     Line number: correct implementation for this line (with fixed bug)
@@ -264,24 +265,26 @@ def show_duel_interface(duel_id, user_id):
     opponent_id = duel["user2_id"] if user_id == duel["user1_id"] else duel["user1_id"]
     opponent = state["users"][opponent_id]
 
-    # Check for updates every 2 seconds
-    if "last_duel_update" not in st.session_state:
-        st.session_state.last_duel_update = time.time()
-
-    if time.time() - st.session_state.last_duel_update > 2:
-        st.session_state.last_duel_update = time.time()
-        check_for_duel_updates(duel_id, user_id)
-
+    # Check if the duel has already ended
     if duel["winner_id"]:
         if duel["winner_id"] == user_id:
             st.success("Congratulations! You won the duel!")
         else:
-            st.error("You lost the duel. Better luck next time!")
+            st.error(f"The duel has ended. {opponent['username']} found all the errors first.")
+
+        st.write("Final results:")
+        st.write(f"Your errors found: {len(duel['errors_found'][user_id])}")
+        st.write(f"Opponent errors found: {len(duel['errors_found'][opponent_id])}")
+
         if st.button("Start New Duel"):
             st.session_state.duel_id = None
             st.session_state.selected_lines = []
             st.rerun()
         return
+
+    # Initialize selected_lines if not present
+    if "selected_lines" not in st.session_state:
+        st.session_state.selected_lines = []
 
     col1, col2 = st.columns(2)
     with col1:
@@ -290,14 +293,20 @@ def show_duel_interface(duel_id, user_id):
         elapsed_time = datetime.now(timezone.utc) - datetime.fromisoformat(duel["start_time"])
         st.write(f"Time elapsed: {elapsed_time.total_seconds():.0f} seconds")
 
-    st.write("Debug the following code:")
+    st.write("Find bugs in the following code before your opponent does!")
+
+    # Display unified code block
+    st.code(duel["code_snippet"].strip(), language="cpp")
+
+    st.write("Select the lines containing errors:")
+
     code_lines = duel["code_snippet"].strip().split('\n')
     for i, line in enumerate(code_lines, 1):
         col1, col2 = st.columns([10, 1])
         with col1:
-            st.code(line, language="python")
+            st.code(line, language="cpp")
         with col2:
-            if st.checkbox(f"Error in line {i}", key=f"line_{i}", value=i in st.session_state.selected_lines):
+            if st.checkbox("", key=f"line_{i}", value=i in st.session_state.selected_lines):
                 if i not in st.session_state.selected_lines:
                     st.session_state.selected_lines.append(i)
             else:
@@ -313,7 +322,7 @@ def show_duel_interface(duel_id, user_id):
         if set(duel["errors_found"][user_id]) == set(duel["error_lines"]):
             end_duel(duel_id, user_id)
             st.success("Congratulations! You found all the errors and won the duel!")
-            st.rerun()
+            st.rerun()  # Force a rerun to update the interface
         else:
             correct_errors = [line for line in duel["errors_found"][user_id] if line in duel["error_lines"]]
             st.write("Correct errors found:", ", ".join(map(str, sorted(correct_errors))))
@@ -322,7 +331,7 @@ def show_duel_interface(duel_id, user_id):
             if set(duel["errors_found"][opponent_id]) == set(duel["error_lines"]):
                 end_duel(duel_id, opponent_id)
                 st.error("Your opponent found all the errors first. Better luck next time!")
-                st.rerun()
+                st.rerun()  # Force a rerun to update the interface
 
     # Display opponent's progress
     st.write(f"Opponent errors found: {len(duel['errors_found'][opponent_id])}")
