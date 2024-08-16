@@ -312,18 +312,46 @@ def show_duel_interface(duel_id, user_id):
 
     st.write("Select the lines containing errors:")
 
+    st.markdown(
+        """
+        <style>
+        .stButton button[] {
+            text-align: left;
+            justify-content: start;
+            padding: 1rem 1.5rem;
+            background: rgb(26, 28, 36) !important;
+            width: 100%;
+            font-family: "Source Code Pro", monospace;
+        }
+
+        .stButton div {
+            font-family: "Source Code Pro", monospace;
+        }
+
+        .stButton pre {
+            margin: 0;
+            padding: 0;
+            font-size: 1rem;
+            color: white;
+        }
+
+        .st-emotion-cache-1347cmu {
+            margin: 0 !important;
+        }
+
+        </style>
+        """,
+        unsafe_allow_html=True
+    )
+
     code_lines = duel["code_snippet"].strip().split('\n')
     for i, line in enumerate(code_lines, 1):
-        col1, col2 = st.columns([10, 1])
-        with col1:
-            st.code(line, language="cpp")
-        with col2:
-            if st.checkbox("", key=f"line_{i}", value=i in st.session_state.selected_lines):
-                if i not in st.session_state.selected_lines:
-                    st.session_state.selected_lines.append(i)
+        button_label = f"{line}"
+        if st.button(button_label, key=f"line_{i}", use_container_width=True):
+            if i not in st.session_state.selected_lines:
+                st.session_state.selected_lines.append(i)
             else:
-                if i in st.session_state.selected_lines:
-                    st.session_state.selected_lines.remove(i)
+                st.session_state.selected_lines.remove(i)
 
     st.write("Selected error lines:", ", ".join(map(str, sorted(st.session_state.selected_lines))))
 
@@ -524,7 +552,7 @@ def main():
 
     // Function to update the current topic with blinking effect
     function updateTopic() {
-        const topicElement = document.querySelector('div[data-testid="stText"] p:contains("Current topic:")');
+        const topicElement = document.querySelector('div[data-testid="stMarkdownContainer"] p:contains("Current topic:")');
         if (topicElement) {
             topicElement.style.transition = 'opacity 0.5s';
             topicElement.style.opacity = 0;
