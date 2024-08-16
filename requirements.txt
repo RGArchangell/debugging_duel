@@ -2,3 +2,4 @@ streamlit
 filelock
 streamlit-server-state
 bcrypt
+websockets
